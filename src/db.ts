@@ -53,6 +53,51 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_assignments_user_active
     ON assignments(user_email, is_active);
+
+  CREATE TABLE IF NOT EXISTS admins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL
+  );
+
+  -- Admin-curated list of expected end users (renters). Add-only for the
+  -- MVP per Ariel: no removal/deactivation flow yet. Deliberately separate
+  -- from dev_users, which the mobile app populates automatically on first
+  -- check-in - a tenant can be entered here before they've ever opened the
+  -- app.
+  CREATE TABLE IF NOT EXISTS tenants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- One row per GET /fota/check call - the "User Activity" log shown in
+  -- the admin UI. update_available/firmware_id capture what that specific
+  -- check saw, so history stays accurate even after later reassignment.
+  -- checked_in_at/downloaded_at below use strftime(...,'%f') for
+  -- millisecond precision, not datetime('now')'s whole-second resolution -
+  -- the activity log's "downloaded as of this check-in" comparison
+  -- (routes/admin.ts) needs to tell apart a check-in and a download that
+  -- land in the same second, which happens often in practice (the mobile
+  -- app can check-in and download back to back).
+  CREATE TABLE IF NOT EXISTS checkins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT NOT NULL,
+    checked_in_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+    update_available INTEGER NOT NULL,
+    firmware_id INTEGER REFERENCES firmware(id)
+  );
+
+  -- One row per completed GET /fota/download/:id. This is the backend's
+  -- only real signal for "downloaded" - it has no equivalent signal for
+  -- "written to the lock", since that event happens entirely on the phone
+  -- and is never reported back (see routes/admin.ts activity endpoint).
+  CREATE TABLE IF NOT EXISTS downloads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT NOT NULL,
+    firmware_id INTEGER NOT NULL REFERENCES firmware(id),
+    downloaded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+  );
 `);
 
 export interface FirmwareRow {
@@ -79,4 +124,31 @@ export interface DevUserRow {
   email: string;
   token: string;
   created_at: string;
+}
+
+export interface AdminRow {
+  id: number;
+  email: string;
+  password_hash: string;
+}
+
+export interface TenantRow {
+  id: number;
+  email: string;
+  added_at: string;
+}
+
+export interface CheckinRow {
+  id: number;
+  user_email: string;
+  checked_in_at: string;
+  update_available: number;
+  firmware_id: number | null;
+}
+
+export interface DownloadRow {
+  id: number;
+  user_email: string;
+  firmware_id: number;
+  downloaded_at: string;
 }

@@ -34,6 +34,14 @@ export async function fotaRoutes(app: FastifyInstance): Promise<void> {
   app.get('/fota/check', { preHandler: requireAuth }, async (req, reply) => {
     const email = req.authenticatedEmail!;
     const assignment = getActiveAssignment(email);
+
+    // Logged unconditionally (update available or not) - this is what the
+    // admin UI's "User Activity" log is built from, and "checked in, no
+    // update pending" is itself a meaningful activity row.
+    db.prepare(
+      "INSERT INTO checkins (user_email, checked_in_at, update_available, firmware_id) VALUES (?, strftime('%Y-%m-%d %H:%M:%f', 'now'), ?, ?)",
+    ).run(email, assignment ? 1 : 0, assignment?.id ?? null);
+
     if (!assignment) {
       return reply.send({ updateAvailable: false });
     }
@@ -71,6 +79,16 @@ export async function fotaRoutes(app: FastifyInstance): Promise<void> {
         .code(500)
         .send({ error: 'STORAGE_ERROR', message: 'Assigned firmware file is missing on disk.' });
     }
+
+    // Recorded on successful download only (after the assignment/ownership
+    // checks above and the file-exists check below) - this is the
+    // backend's only real signal for the "Downloaded" column in the admin
+    // UI. There is no equivalent signal for "written to the lock": that
+    // event happens entirely on the phone via NFC and is never reported
+    // back to this backend today (see routes/admin.ts activity endpoint).
+    db.prepare(
+      "INSERT INTO downloads (user_email, firmware_id, downloaded_at) VALUES (?, ?, strftime('%Y-%m-%d %H:%M:%f', 'now'))",
+    ).run(email, assignment.id);
 
     reply.header('Content-Type', 'application/octet-stream');
     reply.header('Content-Disposition', `attachment; filename="${assignment.filename}"`);

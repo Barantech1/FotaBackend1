@@ -13,6 +13,25 @@ Four endpoints (Fastify + TypeScript + Node's built-in `node:sqlite`):
 
 Plus `POST /admin/users` — provisions a dev-only identity (email → opaque bearer token). Not one of the four endpoints above, but required to obtain a token in the first place. This is intentionally minimal: a real login flow is out of scope for the MVP (see the Implementation Plan, Section 16).
 
+## Admin UI
+
+A small admin panel is served by this same service at `/admin` (e.g. `http://localhost:4100/admin`) - no separate frontend project or deploy. It's a single dependency-free HTML/CSS/JS page (`src/adminUiHtml.ts`) that calls the JSON API below.
+
+- **Firmware** - list uploaded firmware, upload new ones.
+- **Assignments** - see/change which firmware each user currently receives (edit supersedes the old assignment; history is kept, not deleted).
+- **Tenants** - an admin-curated, add-only list of expected end users, used to populate the assignment dropdown.
+- **User Activity** - one row per `GET /fota/check` call, sortable by email or time. "Downloaded" is real (backed by a `downloads` log written on every successful `GET /fota/download`). **"Written to lock" is always "Unknown"** - the mobile app never reports an NFC write outcome back to this backend today; that event lives only in the phone's local Redux state. Showing it truthfully would need a new mobile-app-to-backend reporting endpoint, which is out of scope until specifically approved.
+- **Admins** - read-only list of who can sign in here.
+
+**Auth**: a signed, `HttpOnly` session cookie (no session-store dependency - the signature alone proves validity, so it survives fine in a single-process deployment). Admin accounts are configured entirely via environment variable, not through the UI:
+
+```bash
+FOTA_ADMIN_CREDENTIALS="ariel@barantech.com:some-password,colleague@barantech.com:other-password"
+FOTA_ADMIN_SESSION_SECRET="any-long-random-string"   # optional locally, required in production
+```
+
+On every boot, each `email:password` pair in `FOTA_ADMIN_CREDENTIALS` is hashed (scrypt) and upserted into the `admins` table - so changing a password is "edit the env var, restart the process." If `FOTA_ADMIN_SESSION_SECRET` is unset, a random one is generated at boot, which means every admin gets signed out on every restart - fine for local dev, but set it explicitly on Railway so a redeploy doesn't sign everyone out.
+
 ## Why `node:sqlite` instead of `better-sqlite3`
 
 `better-sqlite3` needs native compilation (node-gyp) and this machine has no C++ build toolchain installed. Node's built-in `node:sqlite` (stable enough for this local MVP, currently marked experimental by Node itself) needs no native module at all. If that constraint changes, swapping back is a small, contained change (only `src/db.ts` touches the DB API directly).
@@ -21,15 +40,15 @@ Plus `POST /admin/users` — provisions a dev-only identity (email → opaque be
 
 ```bash
 npm install
-npm run dev      # tsx watch, http://localhost:4100 by default
+FOTA_ADMIN_CREDENTIALS="ariel@barantech.com:some-password" npm run dev   # tsx watch, http://localhost:4100 by default
 ```
 
-Set `PORT` / `HOST` env vars to change the bind address. The phone must reach this over your LAN — `localhost` on the phone means the phone itself, not this PC. Find this PC's LAN IP and configure the mobile app's `API_BASE_URL` to point at `http://<this-pc-lan-ip>:4100`.
+Set `PORT` / `HOST` env vars to change the bind address. The phone must reach this over your LAN — `localhost` on the phone means the phone itself, not this PC. Find this PC's LAN IP and configure the mobile app's `API_BASE_URL` to point at `http://<this-pc-lan-ip>:4100`. Open `http://<host>:4100/admin` for the admin UI - see "Admin UI" above for `FOTA_ADMIN_CREDENTIALS`.
 
 ## Test it
 
 ```bash
-npm test        # vitest — identity-invariant and one-active-assignment-per-user tests included
+npm test        # vitest — identity-invariant, one-active-assignment-per-user, and admin-session/activity-log tests included
 npm run typecheck
 ```
 

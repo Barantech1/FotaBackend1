@@ -2,6 +2,9 @@ node_modules/
 dist/
 data/*.db
 data/*.db-journal
+data/*.db-shm
+data/*.db-wal
 firmware-storage/*
 !firmware-storage/.gitkeep
 *.log
+.env

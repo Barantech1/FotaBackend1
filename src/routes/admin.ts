@@ -3,25 +3,69 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { FastifyInstance } from 'fastify';
-import { db, type FirmwareRow } from '../db.js';
+import { db, type FirmwareRow, type TenantRow } from '../db.js';
+import {
+  bootstrapAdmins,
+  clearSessionCookie,
+  findAdminByEmail,
+  getSessionEmail,
+  requireAdminSession,
+  setSessionCookie,
+  verifyPassword,
+} from '../adminAuth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIRMWARE_DIR = path.join(__dirname, '..', '..', 'firmware-storage');
 
 /**
- * Admin/provisioning routes (Implementation Plan v0.2, Section 7). Not
- * authenticated by design for this local-only MVP - "admin" here means
- * "operated by Ariel directly on his own PC", not a role distinct from
- * end-user auth. No production hardening is implied or intended.
+ * Admin/provisioning routes (Implementation Plan v0.2, Section 7).
+ * POST /admin/users stays unauthenticated - it's called transparently by
+ * the mobile app itself (via FotaAutoCheck), not by a human admin, so it
+ * can't require an admin session. Every other /admin/* route below now
+ * requires the cookie session set by POST /admin/api/login.
  */
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   await mkdir(FIRMWARE_DIR, { recursive: true });
+  bootstrapAdmins();
+
+  app.get('/admin/api/session', async (req, reply) => {
+    const email = getSessionEmail(req);
+    return reply.send({ signedIn: email != null, email: email ?? null });
+  });
+
+  app.post('/admin/api/login', async (req, reply) => {
+    const body = req.body as { email?: string; password?: string } | undefined;
+    const email = body?.email?.trim().toLowerCase();
+    const password = body?.password;
+    if (!email || !password) {
+      return reply.code(400).send({ error: 'BAD_REQUEST', message: 'email and password are required.' });
+    }
+    const admin = findAdminByEmail(email);
+    // TEMPORARY diagnostic (2026-09-15) - never logs the password itself,
+    // only its length and whether an admin row for this email exists, to
+    // debug a login failure that curl couldn't reproduce directly.
+    console.log(
+      `[login attempt] email=${JSON.stringify(email)} passwordLength=${password.length} adminFound=${Boolean(admin)}`,
+    );
+    if (!admin || !verifyPassword(password, admin.password_hash)) {
+      return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Invalid email or password.' });
+    }
+    setSessionCookie(reply, admin.email);
+    return reply.send({ email: admin.email });
+  });
+
+  app.post('/admin/api/logout', async (_req, reply) => {
+    clearSessionCookie(reply);
+    return reply.send({ ok: true });
+  });
 
   // Provisions a dev-only identity: maps an email to an opaque bearer
   // token the mobile app then sends as Authorization: Bearer <token>.
   // Exists because the four endpoints in the approved plan presuppose
   // *some* way to obtain a token in the first place; not itself one of
-  // the four, but required for them to be usable at all.
+  // the four, but required for them to be usable at all. Left
+  // unauthenticated: the mobile app calls this transparently, with no
+  // human admin in the loop.
   app.post('/admin/users', async (req, reply) => {
     const body = req.body as { email?: string } | undefined;
     const email = body?.email?.trim().toLowerCase();
@@ -43,7 +87,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   // "file" (the firmware/delta binary). Stores the file under
   // firmware-storage/, records metadata including a server-computed
   // SHA-256 (never trusting a client-supplied checksum).
-  app.post('/admin/firmware', async (req, reply) => {
+  app.post('/admin/firmware', { preHandler: requireAdminSession }, async (req, reply) => {
     const data = await req.file();
     if (!data) {
       return reply.code(400).send({ error: 'BAD_REQUEST', message: 'multipart file field "file" is required.' });
@@ -86,7 +130,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   // email. One active assignment per user (Implementation Plan v0.2,
   // Section 7/15) - any prior active assignment for the same email is
   // deactivated, never deleted, so assignment history is preserved.
-  app.post('/admin/assignments', async (req, reply) => {
+  app.post('/admin/assignments', { preHandler: requireAdminSession }, async (req, reply) => {
     const body = req.body as { firmwareId?: number; userEmail?: string } | undefined;
     const firmwareId = body?.firmwareId;
     const userEmail = body?.userEmail?.trim().toLowerCase();
@@ -128,5 +172,136 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       userEmail,
       isActive: true,
     });
+  });
+
+  // GET /admin/api/firmware - full firmware list for the "Firmware" tab.
+  app.get('/admin/api/firmware', { preHandler: requireAdminSession }, async (_req, reply) => {
+    const rows = db
+      .prepare('SELECT * FROM firmware ORDER BY uploaded_at DESC')
+      .all() as unknown as FirmwareRow[];
+    return reply.send(
+      rows.map((f) => ({
+        id: f.id,
+        filename: f.filename,
+        version: f.version,
+        fileSizeBytes: f.file_size_bytes,
+        checksumSha256: f.checksum_sha256,
+        uploadedAt: f.uploaded_at,
+        isActive: Boolean(f.is_active),
+      })),
+    );
+  });
+
+  // GET /admin/api/assignments - active assignments only, joined with
+  // firmware so the UI can show version/filename without a second call.
+  // Superseded assignments are intentionally omitted here (history is
+  // still preserved in the table itself, just not surfaced in this list).
+  app.get('/admin/api/assignments', { preHandler: requireAdminSession }, async (_req, reply) => {
+    const rows = db
+      .prepare(
+        `SELECT a.id AS assignment_id, a.user_email, a.assigned_at, f.id AS firmware_id, f.version, f.filename
+         FROM assignments a
+         JOIN firmware f ON f.id = a.firmware_id
+         WHERE a.is_active = 1
+         ORDER BY a.assigned_at DESC`,
+      )
+      .all() as Array<{
+      assignment_id: number;
+      user_email: string;
+      assigned_at: string;
+      firmware_id: number;
+      version: string;
+      filename: string;
+    }>;
+    return reply.send(
+      rows.map((r) => ({
+        assignmentId: r.assignment_id,
+        userEmail: r.user_email,
+        assignedAt: r.assigned_at,
+        firmwareId: r.firmware_id,
+        firmwareVersion: r.version,
+        firmwareFilename: r.filename,
+      })),
+    );
+  });
+
+  // GET/POST /admin/api/tenants - admin-curated list of expected end
+  // users. Add-only for the MVP (Ariel: "strictly add-only"); emails need
+  // not have appeared in the check-in log first (Ariel: "OK to add
+  // upfront"), but ARE cross-referenced against it client-side so the
+  // admin can double-check a real check-in exists before adding.
+  app.get('/admin/api/tenants', { preHandler: requireAdminSession }, async (_req, reply) => {
+    const rows = db
+      .prepare('SELECT * FROM tenants ORDER BY added_at DESC')
+      .all() as unknown as TenantRow[];
+    return reply.send(rows.map((t) => ({ email: t.email, addedAt: t.added_at })));
+  });
+
+  app.post('/admin/api/tenants', { preHandler: requireAdminSession }, async (req, reply) => {
+    const body = req.body as { email?: string } | undefined;
+    const email = body?.email?.trim().toLowerCase();
+    if (!email) {
+      return reply.code(400).send({ error: 'BAD_REQUEST', message: 'email is required.' });
+    }
+    const existing = db.prepare('SELECT * FROM tenants WHERE email = ?').get(email);
+    if (existing) {
+      return reply.code(409).send({ error: 'CONFLICT', message: 'That tenant already exists.' });
+    }
+    db.prepare('INSERT INTO tenants (email) VALUES (?)').run(email);
+    return reply.code(201).send({ email });
+  });
+
+  // GET /admin/api/admins - read-only list of who else can sign in.
+  app.get('/admin/api/admins', { preHandler: requireAdminSession }, async (_req, reply) => {
+    const rows = db.prepare('SELECT email FROM admins ORDER BY email ASC').all() as Array<{
+      email: string;
+    }>;
+    return reply.send(rows.map((r) => r.email));
+  });
+
+  // GET /admin/api/activity - the "User Activity" log (formerly "Dev
+  // Users"): one row per GET /fota/check call, sortable by email or time.
+  // "downloaded" is real (joined against the downloads table - true if
+  // this user had already downloaded that checkin's firmware by the time
+  // of this check-in, so once true it stays true for every later
+  // check-in too - a timeline, not a one-shot flag).
+  // "writtenToLock" has NO real signal yet and is always null/unknown -
+  // the mobile app never reports an NFC write outcome back to this
+  // backend today. Surfaced honestly as "unknown" rather than guessed.
+  app.get('/admin/api/activity', { preHandler: requireAdminSession }, async (req, reply) => {
+    const query = req.query as { sortKey?: string; sortDir?: string };
+    const sortKey = query.sortKey === 'email' ? 'user_email' : 'checked_in_at';
+    const sortDir = query.sortDir === 'asc' ? 'ASC' : 'DESC';
+
+    const rows = db
+      .prepare(
+        `SELECT c.id, c.user_email, c.checked_in_at, c.update_available, c.firmware_id,
+                EXISTS(
+                  SELECT 1 FROM downloads d
+                  WHERE d.user_email = c.user_email
+                    AND d.firmware_id = c.firmware_id
+                    AND d.downloaded_at <= c.checked_in_at
+                ) AS downloaded
+         FROM checkins c
+         ORDER BY ${sortKey} ${sortDir}`,
+      )
+      .all() as Array<{
+      id: number;
+      user_email: string;
+      checked_in_at: string;
+      update_available: number;
+      firmware_id: number | null;
+      downloaded: number;
+    }>;
+
+    return reply.send(
+      rows.map((r) => ({
+        email: r.user_email,
+        checkedInAt: r.checked_in_at,
+        updateWasAvailable: Boolean(r.update_available),
+        downloaded: r.update_available ? Boolean(r.downloaded) : null,
+        writtenToLock: null,
+      })),
+    );
   });
 }

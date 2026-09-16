@@ -9,17 +9,34 @@ import { createHash } from 'node:crypto';
 // first import).
 const testDataDir = mkdtempSync(path.join(tmpdir(), 'fota-backend-test-'));
 process.env.FOTA_DATA_DIR = testDataDir;
+process.env.FOTA_ADMIN_CREDENTIALS = 'admin@example.com:test-password';
 
 const { buildServer } = await import('../src/server.js');
 const { db } = await import('../src/db.js');
 
 function resetDb() {
-  db.exec('DELETE FROM assignments; DELETE FROM firmware; DELETE FROM dev_users;');
+  // checkins/downloads reference firmware(id) - must be cleared before
+  // firmware itself, or foreign_keys=ON rejects the delete.
+  db.exec(
+    'DELETE FROM checkins; DELETE FROM downloads; DELETE FROM assignments; DELETE FROM firmware; DELETE FROM dev_users; DELETE FROM tenants;',
+  );
 }
 
 async function createUser(app: Awaited<ReturnType<typeof buildServer>>, email: string) {
   const res = await app.inject({ method: 'POST', url: '/admin/users', payload: { email } });
   return res.json().token as string;
+}
+
+// The admin session cookie for /admin/firmware and /admin/assignments -
+// both now require an admin to be signed in (src/adminAuth.ts).
+async function adminCookie(app: Awaited<ReturnType<typeof buildServer>>): Promise<string> {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/admin/api/login',
+    payload: { email: 'admin@example.com', password: 'test-password' },
+  });
+  const setCookie = res.headers['set-cookie'] as string;
+  return setCookie.split(';')[0];
 }
 
 async function uploadFirmware(
@@ -37,10 +54,26 @@ async function uploadFirmware(
   const res = await app.inject({
     method: 'POST',
     url: '/admin/firmware',
-    headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+    headers: {
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+      cookie: await adminCookie(app),
+    },
     payload: body,
   });
   return res.json();
+}
+
+async function assignFirmware(
+  app: Awaited<ReturnType<typeof buildServer>>,
+  firmwareId: number,
+  userEmail: string,
+) {
+  return app.inject({
+    method: 'POST',
+    url: '/admin/assignments',
+    headers: { cookie: await adminCookie(app) },
+    payload: { firmwareId, userEmail },
+  });
 }
 
 describe('FOTA backend', () => {
@@ -86,11 +119,7 @@ describe('FOTA backend', () => {
   it('assigns firmware to a user and GET /fota/check reports it', async () => {
     const token = await createUser(app, 'carol@example.com');
     const fw = await uploadFirmware(app, '2.0.0', 'patch-bytes');
-    await app.inject({
-      method: 'POST',
-      url: '/admin/assignments',
-      payload: { firmwareId: fw.id, userEmail: 'carol@example.com' },
-    });
+    await assignFirmware(app, fw.id, 'carol@example.com');
 
     const res = await app.inject({
       method: 'GET',
@@ -106,11 +135,7 @@ describe('FOTA backend', () => {
     const tokenA = await createUser(app, 'dave@example.com');
     await createUser(app, 'erin@example.com');
     const fw = await uploadFirmware(app, '3.0.0', 'daves-patch');
-    await app.inject({
-      method: 'POST',
-      url: '/admin/assignments',
-      payload: { firmwareId: fw.id, userEmail: 'dave@example.com' },
-    });
+    await assignFirmware(app, fw.id, 'dave@example.com');
 
     // erin's own token must never see dave's assignment, regardless of
     // what firmwareId or email she might try to reference.
@@ -151,16 +176,8 @@ describe('FOTA backend', () => {
     const fwOld = await uploadFirmware(app, '1.0.0', 'old');
     const fwNew = await uploadFirmware(app, '1.1.0', 'new');
 
-    await app.inject({
-      method: 'POST',
-      url: '/admin/assignments',
-      payload: { firmwareId: fwOld.id, userEmail: 'frank@example.com' },
-    });
-    await app.inject({
-      method: 'POST',
-      url: '/admin/assignments',
-      payload: { firmwareId: fwNew.id, userEmail: 'frank@example.com' },
-    });
+    await assignFirmware(app, fwOld.id, 'frank@example.com');
+    await assignFirmware(app, fwNew.id, 'frank@example.com');
 
     const res = await app.inject({
       method: 'GET',
@@ -194,5 +211,126 @@ describe('FOTA backend', () => {
       headers: { authorization: 'Bearer not-a-real-token' },
     });
     expect(res.statusCode).toBe(401);
+  });
+
+  describe('admin UI', () => {
+    it('rejects admin API/write routes without a session, and rejects a wrong password', async () => {
+      const noSession = await app.inject({ method: 'GET', url: '/admin/api/firmware' });
+      expect(noSession.statusCode).toBe(401);
+
+      const wrongPassword = await app.inject({
+        method: 'POST',
+        url: '/admin/api/login',
+        payload: { email: 'admin@example.com', password: 'not-the-password' },
+      });
+      expect(wrongPassword.statusCode).toBe(401);
+    });
+
+    it('logs in, reads a signed session back, and logs out', async () => {
+      const login = await app.inject({
+        method: 'POST',
+        url: '/admin/api/login',
+        payload: { email: 'admin@example.com', password: 'test-password' },
+      });
+      expect(login.statusCode).toBe(200);
+      const cookie = (login.headers['set-cookie'] as string).split(';')[0];
+
+      const session = await app.inject({
+        method: 'GET',
+        url: '/admin/api/session',
+        headers: { cookie },
+      });
+      expect(session.json()).toEqual({ signedIn: true, email: 'admin@example.com' });
+
+      const logout = await app.inject({
+        method: 'POST',
+        url: '/admin/api/logout',
+        headers: { cookie },
+      });
+      expect(logout.statusCode).toBe(200);
+
+      const sessionCookie = (logout.headers['set-cookie'] as string).split(';')[0];
+      const afterLogout = await app.inject({
+        method: 'GET',
+        url: '/admin/api/session',
+        headers: { cookie: sessionCookie },
+      });
+      expect(afterLogout.json().signedIn).toBe(false);
+    });
+
+    it('tenants are add-only and reject a duplicate email', async () => {
+      const cookie = await adminCookie(app);
+      const first = await app.inject({
+        method: 'POST',
+        url: '/admin/api/tenants',
+        headers: { cookie },
+        payload: { email: 'dana@example.com' },
+      });
+      expect(first.statusCode).toBe(201);
+
+      const duplicate = await app.inject({
+        method: 'POST',
+        url: '/admin/api/tenants',
+        headers: { cookie },
+        payload: { email: 'dana@example.com' },
+      });
+      expect(duplicate.statusCode).toBe(409);
+
+      const list = await app.inject({ method: 'GET', url: '/admin/api/tenants', headers: { cookie } });
+      expect(list.json()).toHaveLength(1);
+    });
+
+    it('records a User Activity check-in on every /fota/check call, and marks "downloaded" only after a real download', async () => {
+      const token = await createUser(app, 'heidi@example.com');
+      const fw = await uploadFirmware(app, '1.0.0', 'heidis-patch');
+      await assignFirmware(app, fw.id, 'heidi@example.com');
+
+      await app.inject({
+        method: 'GET',
+        url: '/fota/check',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      const cookie = await adminCookie(app);
+      const beforeDownload = await app.inject({
+        method: 'GET',
+        url: '/admin/api/activity',
+        headers: { cookie },
+      });
+      const rowsBefore = beforeDownload.json();
+      expect(rowsBefore).toHaveLength(1);
+      expect(rowsBefore[0]).toMatchObject({
+        email: 'heidi@example.com',
+        updateWasAvailable: true,
+        downloaded: false,
+        writtenToLock: null,
+      });
+
+      await app.inject({
+        method: 'GET',
+        url: `/fota/download/${fw.id}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      await app.inject({
+        method: 'GET',
+        url: '/fota/check',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      const afterDownload = await app.inject({
+        method: 'GET',
+        url: '/admin/api/activity?sortKey=time&sortDir=asc',
+        headers: { cookie },
+      });
+      const rowsAfter = afterDownload.json() as Array<{ downloaded: boolean | null }>;
+      expect(rowsAfter).toHaveLength(2);
+      // "Downloaded" reflects status AS OF that check-in: the first
+      // check-in happened before the download and stays "not yet"
+      // forever (historical record); the second happened after the
+      // download and sees it as already done.
+      expect(rowsAfter[0].downloaded).toBe(false);
+      expect(rowsAfter[1].downloaded).toBe(true);
+    });
   });
 });

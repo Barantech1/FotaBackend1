@@ -2,12 +2,14 @@ import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import { pathToFileURL } from 'node:url';
 import { adminRoutes } from './routes/admin.js';
+import { adminUiRoutes } from './routes/admin-ui.js';
 import { fotaRoutes } from './routes/fota.js';
 
 export function buildServer() {
   const app = Fastify({ logger: false });
   app.register(multipart);
   app.register(adminRoutes);
+  app.register(adminUiRoutes);
   app.register(fotaRoutes);
   app.get('/health', async () => ({ status: 'ok' }));
   return app;
