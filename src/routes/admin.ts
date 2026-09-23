@@ -13,6 +13,7 @@ import {
   setSessionCookie,
   verifyPassword,
 } from '../adminAuth.js';
+import { requireCognitoIdentity } from '../cognitoAuth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIRMWARE_DIR = path.join(__dirname, '..', '..', 'firmware-storage');
@@ -59,19 +60,21 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ok: true });
   });
 
-  // Provisions a dev-only identity: maps an email to an opaque bearer
-  // token the mobile app then sends as Authorization: Bearer <token>.
-  // Exists because the four endpoints in the approved plan presuppose
-  // *some* way to obtain a token in the first place; not itself one of
-  // the four, but required for them to be usable at all. Left
-  // unauthenticated: the mobile app calls this transparently, with no
-  // human admin in the loop.
-  app.post('/admin/users', async (req, reply) => {
-    const body = req.body as { email?: string } | undefined;
-    const email = body?.email?.trim().toLowerCase();
-    if (!email) {
-      return reply.code(400).send({ error: 'BAD_REQUEST', message: 'email is required.' });
-    }
+  // Provisions a dev-only identity: maps the caller's VERIFIED Cognito
+  // identity to an opaque bearer token the mobile app then sends as
+  // Authorization: Bearer <token> to /fota/check and /fota/download.
+  // Exists because those two endpoints presuppose *some* way to obtain a
+  // token in the first place; not itself one of them, but required for
+  // them to be usable at all.
+  //
+  // Identity comes exclusively from requireCognitoIdentity's verification
+  // of the caller's own Cognito ID token (../cognitoAuth.ts) - never from
+  // a client-supplied email in the request body. This endpoint has no
+  // human-admin session (the mobile app calls it transparently, with no
+  // login screen of its own), so a verified Cognito token is the
+  // replacement for that missing admin gate, not an optional add-on.
+  app.post('/admin/users', { preHandler: requireCognitoIdentity }, async (req, reply) => {
+    const email = req.verifiedFotaEmail!;
     const existing = db.prepare('SELECT * FROM dev_users WHERE email = ?').get(email) as
       | { token: string }
       | undefined;

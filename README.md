@@ -11,7 +11,18 @@ Four endpoints (Fastify + TypeScript + Node's built-in `node:sqlite`):
 - `GET /fota/check` — authenticated. Reports whether an update is available for the caller. Identity comes **only** from the bearer token, never from a client-supplied field.
 - `GET /fota/download/:firmwareId` — authenticated. Serves the firmware only if it's the one currently assigned to the caller.
 
-Plus `POST /admin/users` — provisions a dev-only identity (email → opaque bearer token). Not one of the four endpoints above, but required to obtain a token in the first place. This is intentionally minimal: a real login flow is out of scope for the MVP (see the Implementation Plan, Section 16).
+Plus `POST /admin/users` — provisions a dev-only identity (verified Cognito identity → opaque bearer token). Not one of the four endpoints above, but required to obtain a token in the first place. Authenticated by the caller's own Cognito ID token (see "Mobile identity verification" below) rather than a login flow of its own - a real admin login flow remains out of scope for the MVP (see the Implementation Plan, Section 16).
+
+## Mobile identity verification
+
+`POST /admin/users` requires `Authorization: Bearer <Cognito ID token>` - the same token already issued by the mobile app's existing Cognito sign-in (no separate login flow, no APK-embedded secret). The backend verifies the token's signature, issuer, audience, and `token_use=id` claim (via `aws-jwt-verify`), then derives the caller's identity from the token's own verified `email` claim - never from a client-supplied value. The tenant-prefixed username convention (`tenant-<uuid>-<real email>`) is stripped server-side from that verified claim.
+
+```bash
+FOTA_COGNITO_USER_POOL_ID="us-east-1_Nd6IAgnyc"      # must match the mobile app's EXPO_PUBLIC_AWS_COGNITO_USER_POOL_ID
+FOTA_COGNITO_CLIENT_ID="481gc8ojk5tiiipvs0g0cfagkq"  # must match EXPO_PUBLIC_AWS_COGNITO_USER_POOL_CLIENT_ID
+```
+
+Neither value is a secret (both are already embedded in the mobile app's own public build config) - they just need to match the same Cognito User Pool/App Client the mobile app signs in against. If either is unset, `POST /admin/users` returns `503` (server misconfigured) rather than accepting any request.
 
 ## Admin UI
 
@@ -40,7 +51,10 @@ On every boot, each `email:password` pair in `FOTA_ADMIN_CREDENTIALS` is hashed 
 
 ```bash
 npm install
-FOTA_ADMIN_CREDENTIALS="ariel@barantech.com:some-password" npm run dev   # tsx watch, http://localhost:4100 by default
+FOTA_ADMIN_CREDENTIALS="ariel@barantech.com:some-password" \
+FOTA_COGNITO_USER_POOL_ID="us-east-1_Nd6IAgnyc" \
+FOTA_COGNITO_CLIENT_ID="481gc8ojk5tiiipvs0g0cfagkq" \
+npm run dev   # tsx watch, http://localhost:4100 by default
 ```
 
 Set `PORT` / `HOST` env vars to change the bind address. The phone must reach this over your LAN — `localhost` on the phone means the phone itself, not this PC. Find this PC's LAN IP and configure the mobile app's `API_BASE_URL` to point at `http://<this-pc-lan-ip>:4100`. Open `http://<host>:4100/admin` for the admin UI - see "Admin UI" above for `FOTA_ADMIN_CREDENTIALS`.

@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
 
 // Point at a fresh, disposable SQLite file per test run BEFORE importing
 // anything that touches the db module (module-level side effects run on
@@ -11,8 +11,53 @@ const testDataDir = mkdtempSync(path.join(tmpdir(), 'fota-backend-test-'));
 process.env.FOTA_DATA_DIR = testDataDir;
 process.env.FOTA_ADMIN_CREDENTIALS = 'admin@example.com:test-password';
 
+// Fake but syntactically-valid Cognito identifiers (aws-jwt-verify's
+// CognitoJwtVerifier.parseUserPoolId requires the real <region>_<id>
+// shape) - never contacts real Cognito; see cacheJwks() below.
+const TEST_USER_POOL_ID = 'us-east-1_TESTPOOL1';
+const TEST_CLIENT_ID = 'test-client-id-123';
+const TEST_ISSUER = `https://cognito-idp.us-east-1.amazonaws.com/${TEST_USER_POOL_ID}`;
+const TEST_KID = 'test-signing-key-1';
+process.env.FOTA_COGNITO_USER_POOL_ID = TEST_USER_POOL_ID;
+process.env.FOTA_COGNITO_CLIENT_ID = TEST_CLIENT_ID;
+
 const { buildServer } = await import('../src/server.js');
 const { db } = await import('../src/db.js');
+const { getCognitoVerifierForTesting } = await import('../src/cognitoAuth.js');
+
+// Self-generated RSA keypair, cached directly into the verifier via
+// cacheJwks() below - this exercises aws-jwt-verify's REAL signature,
+// issuer, audience, and token_use verification end to end, against a
+// locally-signed token, with no network call to the real Cognito JWKS
+// endpoint.
+const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+getCognitoVerifierForTesting().cacheJwks({
+  keys: [{ ...(publicKey.export({ format: 'jwk' }) as { kty: string; n: string; e: string }), kid: TEST_KID, alg: 'RS256', use: 'sig' }],
+});
+
+function base64url(input: Buffer | string): string {
+  return Buffer.from(input).toString('base64url');
+}
+
+function signTestIdToken(
+  claims: Record<string, unknown>,
+  options?: { key?: KeyObject; kid?: string },
+): string {
+  const header = { alg: 'RS256', typ: 'JWT', kid: options?.kid ?? TEST_KID };
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: TEST_ISSUER,
+    aud: TEST_CLIENT_ID,
+    token_use: 'id',
+    sub: 'test-sub-0000',
+    iat: nowSeconds,
+    exp: nowSeconds + 3600,
+    ...claims,
+  };
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+  const signature = cryptoSign('RSA-SHA256', Buffer.from(signingInput), options?.key ?? privateKey);
+  return `${signingInput}.${base64url(signature)}`;
+}
 
 function resetDb() {
   // checkins/downloads reference firmware(id) - must be cleared before
@@ -23,7 +68,12 @@ function resetDb() {
 }
 
 async function createUser(app: Awaited<ReturnType<typeof buildServer>>, email: string) {
-  const res = await app.inject({ method: 'POST', url: '/admin/users', payload: { email } });
+  const idToken = signTestIdToken({ email });
+  const res = await app.inject({
+    method: 'POST',
+    url: '/admin/users',
+    headers: { authorization: `Bearer ${idToken}` },
+  });
   return res.json().token as string;
 }
 
@@ -331,6 +381,117 @@ describe('FOTA backend', () => {
       // download and sees it as already done.
       expect(rowsAfter[0].downloaded).toBe(false);
       expect(rowsAfter[1].downloaded).toBe(true);
+    });
+  });
+
+  describe('POST /admin/users - Cognito identity verification', () => {
+    it('valid Cognito ID token: provisioning succeeds and a dev_users row is created for the verified email', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: { authorization: `Bearer ${signTestIdToken({ email: 'ivy@example.com' })}` },
+      });
+      expect(res.statusCode).toBe(201);
+      const body = res.json();
+      expect(body.email).toBe('ivy@example.com');
+      expect(body.token.length).toBeGreaterThan(20);
+
+      const row = db.prepare('SELECT * FROM dev_users WHERE email = ?').get('ivy@example.com');
+      expect(row).toBeDefined();
+    });
+
+    it('missing token: rejected, no dev_users row created', async () => {
+      const res = await app.inject({ method: 'POST', url: '/admin/users' });
+      expect(res.statusCode).toBe(401);
+      expect(db.prepare('SELECT COUNT(*) AS n FROM dev_users').get()).toEqual({ n: 0 });
+    });
+
+    it('invalid token (tampered signature): rejected, no dev_users row created', async () => {
+      const validToken = signTestIdToken({ email: 'mallory@example.com' });
+      const tamperedToken = validToken.slice(0, -4) + 'XXXX';
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: { authorization: `Bearer ${tamperedToken}` },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(db.prepare('SELECT COUNT(*) AS n FROM dev_users').get()).toEqual({ n: 0 });
+    });
+
+    it('wrong issuer: rejected, no dev_users row created', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: {
+          authorization: `Bearer ${signTestIdToken({
+            email: 'oscar@example.com',
+            iss: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_WRONGPOOL',
+          })}`,
+        },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(db.prepare('SELECT COUNT(*) AS n FROM dev_users').get()).toEqual({ n: 0 });
+    });
+
+    it('wrong audience: rejected, no dev_users row created', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: {
+          authorization: `Bearer ${signTestIdToken({
+            email: 'peggy@example.com',
+            aud: 'some-other-client-id',
+          })}`,
+        },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(db.prepare('SELECT COUNT(*) AS n FROM dev_users').get()).toEqual({ n: 0 });
+    });
+
+    it('wrong token_use (access token instead of id token): rejected, no dev_users row created', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: {
+          authorization: `Bearer ${signTestIdToken({
+            email: 'trent@example.com',
+            token_use: 'access',
+          })}`,
+        },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(db.prepare('SELECT COUNT(*) AS n FROM dev_users').get()).toEqual({ n: 0 });
+    });
+
+    it('client-supplied email in the request body is ignored - the verified token identity always wins', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: { authorization: `Bearer ${signTestIdToken({ email: 'walter@example.com' })}` },
+        payload: { email: 'attacker@evil.example.com' },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().email).toBe('walter@example.com');
+      expect(
+        db.prepare('SELECT * FROM dev_users WHERE email = ?').get('attacker@evil.example.com'),
+      ).toBeUndefined();
+    });
+
+    it('tenant-prefix normalization still works on the verified email claim', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: {
+          authorization: `Bearer ${signTestIdToken({
+            email: 'tenant-fb67ce97-a4d2-4ffd-9aea-2f62fa4746b3-yolanda@example.com',
+          })}`,
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().email).toBe('yolanda@example.com');
+      expect(
+        db.prepare('SELECT * FROM dev_users WHERE email = ?').get('yolanda@example.com'),
+      ).toBeDefined();
     });
   });
 });
