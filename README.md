@@ -43,6 +43,21 @@ FOTA_ADMIN_SESSION_SECRET="any-long-random-string"   # optional locally, require
 
 On every boot, each `email:password` pair in `FOTA_ADMIN_CREDENTIALS` is hashed (scrypt) and upserted into the `admins` table - so changing a password is "edit the env var, restart the process." If `FOTA_ADMIN_SESSION_SECRET` is unset, a random one is generated at boot, which means every admin gets signed out on every restart - fine for local dev, but set it explicitly on Railway so a redeploy doesn't sign everyone out.
 
+## Requirements
+
+Node **>=22.5.0** (pinned in `package.json`'s `engines` field) - required for `node:sqlite`, used below.
+
+## Data storage paths
+
+`data/fota.db` and `firmware-storage/` default to paths relative to this repo, and both are gitignored/disposable in that default local setup (see "Data" below). Both defaults can be overridden - unset, behavior is unchanged from before:
+
+```bash
+FOTA_DATA_DIR="/path/to/persistent/dir"       # SQLite database directory
+FOTA_FIRMWARE_DIR="/path/to/persistent/dir"   # uploaded firmware files
+```
+
+On Railway, point both at a mounted Volume so data survives a redeploy - the exact path depends on the Volume's mount point, decided at deploy time.
+
 ## Why `node:sqlite` instead of `better-sqlite3`
 
 `better-sqlite3` needs native compilation (node-gyp) and this machine has no C++ build toolchain installed. Node's built-in `node:sqlite` (stable enough for this local MVP, currently marked experimental by Node itself) needs no native module at all. If that constraint changes, swapping back is a small, contained change (only `src/db.ts` touches the DB API directly).
@@ -68,7 +83,7 @@ npm run typecheck
 
 ## Data
 
-`data/fota.db` (SQLite, gitignored) and `firmware-storage/` (uploaded files, gitignored) are created on first run. Both are local-only and disposable — delete them to reset to a clean state.
+`data/fota.db` (SQLite, gitignored) and `firmware-storage/` (uploaded files, gitignored) are created on first run at their default paths, or at `FOTA_DATA_DIR`/`FOTA_FIRMWARE_DIR` if set (see "Data storage paths" above). Both are local-only and disposable by default — delete them to reset to a clean state.
 
 ## Explicitly out of scope for this MVP
 

@@ -16,7 +16,11 @@ import {
 import { requireCognitoIdentity } from '../cognitoAuth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FIRMWARE_DIR = path.join(__dirname, '..', '..', 'firmware-storage');
+// Mirrors db.ts's FOTA_DATA_DIR override pattern - unset locally, so this
+// resolves exactly as before; set on Railway to point at a mounted Volume
+// so uploaded firmware survives a redeploy.
+const FIRMWARE_DIR =
+  process.env.FOTA_FIRMWARE_DIR ?? path.join(__dirname, '..', '..', 'firmware-storage');
 
 /**
  * Admin/provisioning routes (Implementation Plan v0.2, Section 7).
