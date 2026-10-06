@@ -48,12 +48,6 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'BAD_REQUEST', message: 'email and password are required.' });
     }
     const admin = findAdminByEmail(email);
-    // TEMPORARY diagnostic (2026-09-15) - never logs the password itself,
-    // only its length and whether an admin row for this email exists, to
-    // debug a login failure that curl couldn't reproduce directly.
-    console.log(
-      `[login attempt] email=${JSON.stringify(email)} passwordLength=${password.length} adminFound=${Boolean(admin)}`,
-    );
     if (!admin || !verifyPassword(password, admin.password_hash)) {
       return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Invalid email or password.' });
     }
