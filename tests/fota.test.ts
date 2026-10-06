@@ -493,5 +493,25 @@ describe('FOTA backend', () => {
         db.prepare('SELECT * FROM dev_users WHERE email = ?').get('yolanda@example.com'),
       ).toBeDefined();
     });
+
+    it('mixed-case verified email is lowercased so it matches lowercased tenant/assignment emails', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/admin/users',
+        headers: {
+          authorization: `Bearer ${signTestIdToken({
+            email: 'tenant-fb67ce97-a4d2-4ffd-9aea-2f62fa4746b3-Zelda.Mixed+Case@Example.com',
+          })}`,
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().email).toBe('zelda.mixed+case@example.com');
+      expect(
+        db.prepare('SELECT * FROM dev_users WHERE email = ?').get('zelda.mixed+case@example.com'),
+      ).toBeDefined();
+      expect(
+        db.prepare('SELECT * FROM dev_users WHERE email = ?').get('Zelda.Mixed+Case@Example.com'),
+      ).toBeUndefined();
+    });
   });
 });

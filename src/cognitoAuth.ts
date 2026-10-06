@@ -97,5 +97,9 @@ export async function requireCognitoIdentity(
     return;
   }
 
-  req.verifiedFotaEmail = stripTenantPrefix(email);
+  // Lowercased because Cognito preserves the casing the user signed up
+  // with, while the admin endpoints (tenants, assignments) lowercase the
+  // emails they store, and SQLite compares text case-sensitively. Without
+  // this, an assignment for a mixed-case account would never match.
+  req.verifiedFotaEmail = stripTenantPrefix(email).toLowerCase();
 }
