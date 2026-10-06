@@ -1,6 +1,6 @@
 # FOTA MVP Backend
 
-Local-only backend for the Lockfinity FOTA MVP. Runs on Ariel's PC; no cloud infrastructure. See `FOTA_MVP_Implementation_Plan_v0.2.md` (tracked in Ariel's Orchestrator, project "FOTA MVP") for the full plan this implements — this repo is Phase 1 only.
+Backend for the Lockfinity FOTA MVP. Hosted on Railway at `https://fota-backend-production.up.railway.app` (admin UI at `/admin`); it can also run locally for development (see "Run it"). See `FOTA_MVP_Implementation_Plan_v0.2.md` (tracked in Ariel's Orchestrator, project "FOTA MVP") for the full plan this implements — this repo is Phase 1 only.
 
 ## What this is
 
@@ -56,7 +56,11 @@ FOTA_DATA_DIR="/path/to/persistent/dir"       # SQLite database directory
 FOTA_FIRMWARE_DIR="/path/to/persistent/dir"   # uploaded firmware files
 ```
 
-On Railway, point both at a mounted Volume so data survives a redeploy - the exact path depends on the Volume's mount point, decided at deploy time.
+On Railway, both point at the persistent Volume mounted at `/data` (`FOTA_DATA_DIR=/data`, `FOTA_FIRMWARE_DIR=/data/firmware`), so data survives a redeploy.
+
+## Deploy (Railway)
+
+Deployed by CLI upload with `railway up` from this folder; the service is not GitHub-linked, so pushing to GitHub does not deploy. Railway needs `NODE_ENV=production`, the two data-directory variables above, the two Cognito variables, `FOTA_ADMIN_CREDENTIALS` and `FOTA_ADMIN_SESSION_SECRET`. After a deploy, `GET /health` should return 200.
 
 ## Why `node:sqlite` instead of `better-sqlite3`
 
@@ -72,7 +76,7 @@ FOTA_COGNITO_CLIENT_ID="481gc8ojk5tiiipvs0g0cfagkq" \
 npm run dev   # tsx watch, http://localhost:4100 by default
 ```
 
-Set `PORT` / `HOST` env vars to change the bind address. The phone must reach this over your LAN — `localhost` on the phone means the phone itself, not this PC. Find this PC's LAN IP and configure the mobile app's `API_BASE_URL` to point at `http://<this-pc-lan-ip>:4100`. Open `http://<host>:4100/admin` for the admin UI - see "Admin UI" above for `FOTA_ADMIN_CREDENTIALS`.
+Set `PORT` / `HOST` env vars to change the bind address. The released mobile app talks to the Railway URL (baked into the APK at build time via `EXPO_PUBLIC_FOTA_API_BASE_URL`), so a local server is only for development. To point a development build at it, the phone must reach this over your LAN — `localhost` on the phone means the phone itself, not this PC. Find this PC's LAN IP and configure the mobile app's `API_BASE_URL` to point at `http://<this-pc-lan-ip>:4100`. Open `http://<host>:4100/admin` for the admin UI - see "Admin UI" above for `FOTA_ADMIN_CREDENTIALS`.
 
 ## Test it
 
@@ -87,4 +91,4 @@ npm run typecheck
 
 ## Explicitly out of scope for this MVP
 
-No cloud hosting, no production authentication, no firmware validation/installation (the lock's own firmware doesn't implement that yet either — see the Implementation Plan's discovery findings). This backend's job ends at "the assigned firmware bytes were downloaded intact"; everything from NFC transfer onward is Phase 3/4, in the mobile app repository.
+No production-grade authentication (the admin login has no rate limiting or lockout), no firmware validation/installation (the lock's own firmware doesn't implement that yet either — see the Implementation Plan's discovery findings). This backend's job ends at "the assigned firmware bytes were downloaded intact"; everything from NFC transfer onward is Phase 3/4, in the mobile app repository.
