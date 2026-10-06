@@ -33,15 +33,16 @@ A small admin panel is served by this same service at `/admin` (e.g. `http://loc
 - **Tenants** - an admin-curated, add-only list of expected end users, used to populate the assignment dropdown.
 - **User Activity** - one row per `GET /fota/check` call, sortable by email or time. "Downloaded" is real (backed by a `downloads` log written on every successful `GET /fota/download`). **"Written to lock" is always "Unknown"** - the mobile app never reports an NFC write outcome back to this backend today; that event lives only in the phone's local Redux state. Showing it truthfully would need a new mobile-app-to-backend reporting endpoint, which is out of scope until specifically approved.
 - **Admins** - read-only list of who can sign in here.
+- **Change password** (top right) - the signed-in admin changes their own password (`POST /admin/api/password` with `currentPassword` and `newPassword`). Requires the current password. Policy: 12-128 characters, any characters, no leading/trailing space, different from the current one. Saving signs out every other session for that admin.
 
-**Auth**: a signed, `HttpOnly` session cookie (no session-store dependency - the signature alone proves validity, so it survives fine in a single-process deployment). Admin accounts are configured entirely via environment variable, not through the UI:
+**Auth**: a signed, `HttpOnly` session cookie (no session-store dependency - the signature alone proves validity, so it survives fine in a single-process deployment). Each cookie carries the admin's `session_epoch`, which a password change bumps, so older cookies stop working. Admin accounts (which emails exist, and their initial password) are configured via environment variable, not through the UI:
 
 ```bash
 FOTA_ADMIN_CREDENTIALS="ariel@barantech.com:some-password,colleague@barantech.com:other-password"
 FOTA_ADMIN_SESSION_SECRET="any-long-random-string"   # optional locally, required in production
 ```
 
-On every boot, each `email:password` pair in `FOTA_ADMIN_CREDENTIALS` is hashed (scrypt) and upserted into the `admins` table - so changing a password is "edit the env var, restart the process." If `FOTA_ADMIN_SESSION_SECRET` is unset, a random one is generated at boot, which means every admin gets signed out on every restart - fine for local dev, but set it explicitly on Railway so a redeploy doesn't sign everyone out.
+On every boot, each `email:password` pair in `FOTA_ADMIN_CREDENTIALS` creates that admin if missing (password hashed with scrypt). For an existing admin, the env password is applied only when the env value **changed** since it was last applied (a salted fingerprint is kept in `admins.env_password_hash`). So a password changed in the UI survives restarts and redeploys, and setting a *new* value in the env var is the reset path for a forgotten password (it also signs that admin out everywhere). Env passwords can't contain `,` or `:`, the separators above. If `FOTA_ADMIN_SESSION_SECRET` is unset, a random one is generated at boot, which means every admin gets signed out on every restart - fine for local dev, but set it explicitly on Railway so a redeploy doesn't sign everyone out.
 
 ## Requirements
 

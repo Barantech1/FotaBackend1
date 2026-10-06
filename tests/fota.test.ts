@@ -63,7 +63,7 @@ function resetDb() {
   // checkins/downloads reference firmware(id) - must be cleared before
   // firmware itself, or foreign_keys=ON rejects the delete.
   db.exec(
-    'DELETE FROM checkins; DELETE FROM downloads; DELETE FROM assignments; DELETE FROM firmware; DELETE FROM dev_users; DELETE FROM tenants;',
+    'DELETE FROM checkins; DELETE FROM downloads; DELETE FROM assignments; DELETE FROM firmware; DELETE FROM dev_users; DELETE FROM tenants; DELETE FROM admins;',
   );
 }
 
@@ -306,6 +306,106 @@ describe('FOTA backend', () => {
         headers: { cookie: sessionCookie },
       });
       expect(afterLogout.json().signedIn).toBe(false);
+    });
+
+    describe('change password', () => {
+      const NEW_PASSWORD = 'correct horse battery staple';
+
+      async function login(server: typeof app, password: string) {
+        return server.inject({
+          method: 'POST',
+          url: '/admin/api/login',
+          payload: { email: 'admin@example.com', password },
+        });
+      }
+      async function isSignedIn(server: typeof app, cookie: string) {
+        const res = await server.inject({ method: 'GET', url: '/admin/api/session', headers: { cookie } });
+        return res.json().signedIn as boolean;
+      }
+      async function changePassword(cookie: string, currentPassword: string, newPassword: string) {
+        return app.inject({
+          method: 'POST',
+          url: '/admin/api/password',
+          headers: { cookie },
+          payload: { currentPassword, newPassword },
+        });
+      }
+
+      it('changes the password, keeps this session, signs out other sessions', async () => {
+        const cookie = await adminCookie(app);
+        const otherSession = await adminCookie(app);
+
+        const res = await changePassword(cookie, 'test-password', NEW_PASSWORD);
+        expect(res.statusCode).toBe(200);
+        const newCookie = (res.headers['set-cookie'] as string).split(';')[0];
+
+        expect(await isSignedIn(app, newCookie)).toBe(true);
+        expect(await isSignedIn(app, cookie)).toBe(false);
+        expect(await isSignedIn(app, otherSession)).toBe(false);
+        expect((await login(app, 'test-password')).statusCode).toBe(401);
+        expect((await login(app, NEW_PASSWORD)).statusCode).toBe(200);
+      });
+
+      it('rejects no session, a wrong current password, and passwords that break the policy', async () => {
+        const noSession = await app.inject({
+          method: 'POST',
+          url: '/admin/api/password',
+          payload: { currentPassword: 'test-password', newPassword: NEW_PASSWORD },
+        });
+        expect(noSession.statusCode).toBe(401);
+
+        const cookie = await adminCookie(app);
+        expect((await changePassword(cookie, 'not-the-password', NEW_PASSWORD)).statusCode).toBe(403);
+        expect((await changePassword(cookie, 'test-password', 'short-11ch')).statusCode).toBe(400);
+        expect((await changePassword(cookie, 'test-password', 'x'.repeat(129))).statusCode).toBe(400);
+        expect((await changePassword(cookie, 'test-password', ' leading-space-pw')).statusCode).toBe(400);
+        expect((await changePassword(cookie, 'test-password', 'test-password')).statusCode).toBe(400);
+
+        // Nothing changed: the original password and session still work.
+        expect(await isSignedIn(app, cookie)).toBe(true);
+        expect((await login(app, 'test-password')).statusCode).toBe(200);
+      });
+
+      it('a changed password survives a restart with the same FOTA_ADMIN_CREDENTIALS', async () => {
+        const cookie = await adminCookie(app);
+        expect((await changePassword(cookie, 'test-password', NEW_PASSWORD)).statusCode).toBe(200);
+
+        const restarted = buildServer();
+        await restarted.ready();
+        expect((await login(restarted, NEW_PASSWORD)).statusCode).toBe(200);
+        expect((await login(restarted, 'test-password')).statusCode).toBe(401);
+        await restarted.close();
+      });
+
+      it('a NEW value in FOTA_ADMIN_CREDENTIALS resets the password and signs everyone out', async () => {
+        const cookie = await adminCookie(app);
+        const res = await changePassword(cookie, 'test-password', NEW_PASSWORD);
+        const newCookie = (res.headers['set-cookie'] as string).split(';')[0];
+
+        const original = process.env.FOTA_ADMIN_CREDENTIALS;
+        process.env.FOTA_ADMIN_CREDENTIALS = 'admin@example.com:reset-from-env-123';
+        try {
+          const restarted = buildServer();
+          await restarted.ready();
+          expect((await login(restarted, 'reset-from-env-123')).statusCode).toBe(200);
+          expect((await login(restarted, NEW_PASSWORD)).statusCode).toBe(401);
+          expect(await isSignedIn(restarted, newCookie)).toBe(false);
+          await restarted.close();
+        } finally {
+          process.env.FOTA_ADMIN_CREDENTIALS = original;
+        }
+      });
+
+      it('an admin row from before env_password_hash existed takes the env password once', async () => {
+        db.prepare("UPDATE admins SET password_hash = 'stale:stale', env_password_hash = NULL").run();
+
+        const restarted = buildServer();
+        await restarted.ready();
+        expect((await login(restarted, 'test-password')).statusCode).toBe(200);
+        const row = db.prepare('SELECT env_password_hash FROM admins').get() as { env_password_hash: string | null };
+        expect(row.env_password_hash).not.toBeNull();
+        await restarted.close();
+      });
     });
 
     it('tenants are add-only and reject a duplicate email', async () => {

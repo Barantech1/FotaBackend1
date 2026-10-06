@@ -6,11 +6,13 @@ import type { FastifyInstance } from 'fastify';
 import { db, type FirmwareRow, type TenantRow } from '../db.js';
 import {
   bootstrapAdmins,
+  changeAdminPassword,
   clearSessionCookie,
   findAdminByEmail,
   getSessionEmail,
   requireAdminSession,
   setSessionCookie,
+  validateNewAdminPassword,
   verifyPassword,
 } from '../adminAuth.js';
 import { requireCognitoIdentity } from '../cognitoAuth.js';
@@ -55,12 +57,42 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (!admin || !verifyPassword(password, admin.password_hash)) {
       return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Invalid email or password.' });
     }
-    setSessionCookie(reply, admin.email);
+    setSessionCookie(reply, admin.email, admin.session_epoch);
     return reply.send({ email: admin.email });
   });
 
   app.post('/admin/api/logout', async (_req, reply) => {
     clearSessionCookie(reply);
+    return reply.send({ ok: true });
+  });
+
+  // POST /admin/api/password - the signed-in admin changes their own
+  // password. Requires the current password (a stolen session alone can't
+  // lock the owner out). Signs out every other session for this admin and
+  // re-issues this one's cookie. The admin is always the session's, never
+  // a client-supplied email.
+  app.post('/admin/api/password', { preHandler: requireAdminSession }, async (req, reply) => {
+    const body = req.body as { currentPassword?: string; newPassword?: string } | undefined;
+    const currentPassword = body?.currentPassword;
+    const newPassword = body?.newPassword;
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) {
+      return reply
+        .code(400)
+        .send({ error: 'BAD_REQUEST', message: 'Current and new password are required.' });
+    }
+    const admin = findAdminByEmail(req.adminEmail!);
+    if (!admin) {
+      return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Not signed in.' });
+    }
+    if (!verifyPassword(currentPassword, admin.password_hash)) {
+      return reply.code(403).send({ error: 'FORBIDDEN', message: 'The current password is incorrect.' });
+    }
+    const policyError = validateNewAdminPassword(newPassword, currentPassword);
+    if (policyError) {
+      return reply.code(400).send({ error: 'BAD_REQUEST', message: policyError });
+    }
+    const epoch = changeAdminPassword(admin.id, newPassword);
+    setSessionCookie(reply, admin.email, epoch);
     return reply.send({ ok: true });
   });
 

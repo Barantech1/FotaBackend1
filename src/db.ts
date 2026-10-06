@@ -100,6 +100,24 @@ db.exec(`
   );
 `);
 
+// Columns added after the first deployment. CREATE TABLE IF NOT EXISTS
+// above never alters an existing table, so they are added here when missing.
+function addColumnIfMissing(table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+// admins.env_password_hash: salted hash of the FOTA_ADMIN_CREDENTIALS
+// password last applied at boot, so a restart only re-applies the env
+// password when the env value itself changed - a password changed in the
+// admin UI survives restarts (see bootstrapAdmins in adminAuth.ts).
+// admins.session_epoch: embedded in each session cookie and bumped on every
+// password change, which invalidates all sessions issued before it.
+addColumnIfMissing('admins', 'env_password_hash', 'TEXT');
+addColumnIfMissing('admins', 'session_epoch', 'INTEGER NOT NULL DEFAULT 0');
+
 export interface FirmwareRow {
   id: number;
   filename: string;
@@ -130,6 +148,8 @@ export interface AdminRow {
   id: number;
   email: string;
   password_hash: string;
+  env_password_hash: string | null;
+  session_epoch: number;
 }
 
 export interface TenantRow {
