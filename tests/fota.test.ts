@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -274,6 +274,93 @@ describe('FOTA backend', () => {
         payload: { email: 'admin@example.com', password: 'not-the-password' },
       });
       expect(wrongPassword.statusCode).toBe(401);
+    });
+
+    describe('login rate limiting', () => {
+      const FIFTEEN_MINUTES = 15 * 60 * 1000;
+
+      function attempt(email: string, password: string, forwardedFor = '198.51.100.1') {
+        return app.inject({
+          method: 'POST',
+          url: '/admin/api/login',
+          headers: { 'x-forwarded-for': forwardedFor },
+          payload: { email, password },
+        });
+      }
+
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date('2026-10-07T12:00:00Z'));
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('locks an account after 5 failures, with the same message for wrong, unknown and locked', async () => {
+        for (const email of ['admin@example.com', 'nobody@example.com']) {
+          for (let i = 0; i < 5; i++) {
+            const res = await attempt(email, 'wrong-password');
+            expect(res.statusCode).toBe(401);
+            expect(res.json().message).toBe('Invalid email or password.');
+          }
+          const locked = await attempt(email, 'wrong-password');
+          expect(locked.statusCode).toBe(429);
+          expect(locked.json().message).toBe('Invalid email or password.');
+          expect(Number(locked.headers['retry-after'])).toBe(15 * 60);
+        }
+        // While locked, even the right password is refused, without a cookie.
+        const rightPassword = await attempt('admin@example.com', 'test-password');
+        expect(rightPassword.statusCode).toBe(429);
+        expect(rightPassword.headers['set-cookie']).toBeUndefined();
+        // The lockout is per account: other accounts are unaffected.
+        expect((await attempt('other@example.com', 'wrong-password')).statusCode).toBe(401);
+      });
+
+      it('normalizes the email, so case and spaces do not get around a lockout', async () => {
+        for (const email of ['Admin@Example.com', ' admin@example.com', 'ADMIN@EXAMPLE.COM', 'admin@example.com ', 'admin@Example.COM']) {
+          expect((await attempt(email, 'wrong-password')).statusCode).toBe(401);
+        }
+        expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(429);
+      });
+
+      it('lifts the lockout after 15 minutes', async () => {
+        for (let i = 0; i < 5; i++) await attempt('admin@example.com', 'wrong-password');
+        vi.setSystemTime(Date.now() + FIFTEEN_MINUTES - 1000);
+        expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(429);
+        vi.setSystemTime(Date.now() + 1000);
+        expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(200);
+      });
+
+      it('only counts failures within 15 minutes, and a success clears them', async () => {
+        for (let i = 0; i < 4; i++) await attempt('admin@example.com', 'wrong-password');
+        vi.setSystemTime(Date.now() + FIFTEEN_MINUTES);
+        expect((await attempt('admin@example.com', 'wrong-password')).statusCode).toBe(401);
+        expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(200);
+
+        for (let i = 0; i < 4; i++) {
+          expect((await attempt('admin@example.com', 'wrong-password')).statusCode).toBe(401);
+        }
+        expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(200);
+      });
+
+      it('caps failures per IP (the rightmost X-Forwarded-For entry) at 100 per 15 minutes', async () => {
+        // 25 emails x 4 failures: 100 failures from one IP, no account locked.
+        for (let n = 0; n < 25; n++) {
+          for (let i = 0; i < 4; i++) {
+            expect((await attempt(`user${n}@example.com`, 'wrong-password', '203.0.113.7')).statusCode).toBe(401);
+          }
+        }
+        const blocked = await attempt('admin@example.com', 'test-password', '203.0.113.7');
+        expect(blocked.statusCode).toBe(429);
+        expect(blocked.json().message).toBe('Invalid email or password.');
+        // A spoofed leftmost entry doesn't change the IP that is counted.
+        expect((await attempt('admin@example.com', 'test-password', '192.0.2.99, 203.0.113.7')).statusCode).toBe(429);
+        // Another IP is unaffected.
+        expect((await attempt('admin@example.com', 'test-password', '198.51.100.2')).statusCode).toBe(200);
+
+        vi.setSystemTime(Date.now() + FIFTEEN_MINUTES);
+        expect((await attempt('admin@example.com', 'test-password', '203.0.113.7')).statusCode).toBe(200);
+      }, 30_000);
     });
 
     it('logs in, reads a signed session back, and logs out', async () => {

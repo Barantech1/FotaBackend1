@@ -131,6 +131,18 @@ export function verifyPassword(password: string, stored: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+// A real hash of a random password, verified against when the email is
+// unknown, so a login for an unknown email costs the same scrypt work as a
+// wrong password and response timing doesn't reveal which emails are admins.
+const DUMMY_PASSWORD_HASH = hashPassword(randomBytes(16).toString('hex'));
+
+/** The admin for these credentials, or null - same work either way. */
+export function verifyAdminLogin(email: string, password: string): AdminRow | null {
+  const admin = findAdminByEmail(email);
+  const valid = verifyPassword(password, admin?.password_hash ?? DUMMY_PASSWORD_HASH);
+  return admin && valid ? admin : null;
+}
+
 export function findAdminByEmail(email: string): AdminRow | undefined {
   return db.prepare('SELECT * FROM admins WHERE email = ?').get(email.trim().toLowerCase()) as
     | AdminRow

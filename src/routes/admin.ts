@@ -13,9 +13,13 @@ import {
   requireAdminSession,
   setSessionCookie,
   validateNewAdminPassword,
+  verifyAdminLogin,
   verifyPassword,
 } from '../adminAuth.js';
 import { requireCognitoIdentity } from '../cognitoAuth.js';
+import { createLoginRateLimiter } from '../loginRateLimit.js';
+
+const LOGIN_FAILED_MESSAGE = 'Invalid email or password.';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Mirrors db.ts's FOTA_DATA_DIR override pattern - unset locally, so this
@@ -34,6 +38,7 @@ const FIRMWARE_DIR =
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   await mkdir(FIRMWARE_DIR, { recursive: true });
   bootstrapAdmins();
+  const loginLimiter = createLoginRateLimiter();
 
   app.get('/admin/api/session', async (req, reply) => {
     const email = getSessionEmail(req);
@@ -47,10 +52,25 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (!email || !password) {
       return reply.code(400).send({ error: 'BAD_REQUEST', message: 'email and password are required.' });
     }
-    const admin = findAdminByEmail(email);
-    if (!admin || !verifyPassword(password, admin.password_hash)) {
-      return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Invalid email or password.' });
+    // Wrong password, unknown email and a locked account or IP all get the
+    // same message; only the status (429 + Retry-After) tells a lockout
+    // apart. req.ip is the client as seen by the one trusted proxy hop
+    // (server.ts); it is logged here, never sent back.
+    const retryAfterMs = loginLimiter.retryAfterMs(email, req.ip);
+    if (retryAfterMs > 0) {
+      console.log(`[admin login] locked out, status=429 ip=${req.ip}`);
+      return reply
+        .code(429)
+        .header('retry-after', String(Math.ceil(retryAfterMs / 1000)))
+        .send({ error: 'TOO_MANY_REQUESTS', message: LOGIN_FAILED_MESSAGE });
     }
+    const admin = verifyAdminLogin(email, password);
+    if (!admin) {
+      loginLimiter.recordFailure(email, req.ip);
+      console.log(`[admin login] failed, status=401 ip=${req.ip}`);
+      return reply.code(401).send({ error: 'UNAUTHORIZED', message: LOGIN_FAILED_MESSAGE });
+    }
+    loginLimiter.recordSuccess(email);
     setSessionCookie(reply, admin.email, admin.session_epoch);
     return reply.send({ email: admin.email });
   });

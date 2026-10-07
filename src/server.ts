@@ -6,7 +6,11 @@ import { adminUiRoutes } from './routes/admin-ui.js';
 import { fotaRoutes } from './routes/fota.js';
 
 export function buildServer() {
-  const app = Fastify({ logger: false });
+  // trustProxy: 1 - Railway's edge proxy appends the client address to
+  // X-Forwarded-For, so req.ip is that rightmost entry only. Earlier entries
+  // are client-supplied and could be spoofed. Locally (no proxy header)
+  // req.ip is the socket address as before.
+  const app = Fastify({ logger: false, trustProxy: 1 });
   app.register(multipart);
   app.register(adminRoutes);
   app.register(adminUiRoutes);
