@@ -343,22 +343,13 @@ describe('FOTA backend', () => {
         expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(200);
       });
 
-      it('caps failures per IP (the rightmost X-Forwarded-For entry) at 100 per 15 minutes', async () => {
+      it('does not enforce the per-IP cap for now (req.ip is a shared Railway proxy address)', async () => {
         // 25 emails x 4 failures: 100 failures from one IP, no account locked.
         for (let n = 0; n < 25; n++) {
           for (let i = 0; i < 4; i++) {
             expect((await attempt(`user${n}@example.com`, 'wrong-password', '203.0.113.7')).statusCode).toBe(401);
           }
         }
-        const blocked = await attempt('admin@example.com', 'test-password', '203.0.113.7');
-        expect(blocked.statusCode).toBe(429);
-        expect(blocked.json().message).toBe('Invalid email or password.');
-        // A spoofed leftmost entry doesn't change the IP that is counted.
-        expect((await attempt('admin@example.com', 'test-password', '192.0.2.99, 203.0.113.7')).statusCode).toBe(429);
-        // Another IP is unaffected.
-        expect((await attempt('admin@example.com', 'test-password', '198.51.100.2')).statusCode).toBe(200);
-
-        vi.setSystemTime(Date.now() + FIFTEEN_MINUTES);
         expect((await attempt('admin@example.com', 'test-password', '203.0.113.7')).statusCode).toBe(200);
       }, 30_000);
     });

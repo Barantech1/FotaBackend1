@@ -8,6 +8,12 @@
  * emails are admins). Per IP: 100 failures within 15 minutes block that IP
  * until the oldest falls out of the window - best-effort, since the IP is
  * only as trustworthy as the proxy hop it is read from (see server.ts).
+ *
+ * The per-IP block is NOT enforced for now (enforceIpLimit: false): on
+ * Railway, req.ip turned out to be a shared Railway proxy address, not the
+ * client's, so enforcing it would let anyone block every admin's login.
+ * IP failures are still counted, so enforcing it again is a one-flag change
+ * once the real client IP source is confirmed.
  */
 export const ACCOUNT_MAX_FAILURES = 5;
 export const IP_MAX_FAILURES = 100;
@@ -30,7 +36,7 @@ export interface LoginRateLimiter {
   recordSuccess(email: string): void;
 }
 
-export function createLoginRateLimiter(): LoginRateLimiter {
+export function createLoginRateLimiter(options: { enforceIpLimit: boolean }): LoginRateLimiter {
   const accounts = new Map<string, AccountEntry>();
   const ips = new Map<string, number[]>();
 
@@ -52,7 +58,10 @@ export function createLoginRateLimiter(): LoginRateLimiter {
       const now = Date.now();
       const accountWait = Math.max(0, (accounts.get(email)?.lockedUntil ?? 0) - now);
       const ipFailures = recent(ips.get(ip) ?? [], now);
-      const ipWait = ipFailures.length >= IP_MAX_FAILURES ? ipFailures[0] + FAILURE_WINDOW_MS - now : 0;
+      const ipWait =
+        options.enforceIpLimit && ipFailures.length >= IP_MAX_FAILURES
+          ? ipFailures[0] + FAILURE_WINDOW_MS - now
+          : 0;
       return Math.max(accountWait, ipWait);
     },
 
