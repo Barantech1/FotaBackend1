@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import { db, type FirmwareRow, type TenantRow } from '../db.js';
 import {
   bootstrapAdmins,
@@ -18,20 +18,9 @@ import {
 } from '../adminAuth.js';
 import { requireCognitoIdentity } from '../cognitoAuth.js';
 import { createLoginRateLimiter } from '../loginRateLimit.js';
+import { warnOnUnexpectedProxyLayout } from '../proxyLayout.js';
 
 const LOGIN_FAILED_MESSAGE = 'Invalid email or password.';
-
-// TEMPORARY diagnostic, to be removed once the client IP source on Railway
-// is confirmed: the raw forwarding headers of a failed login, for the
-// server log only. Only headers that carry client/proxy addresses are
-// included (no cookies or auth), plus the socket's peer address.
-const FORWARDING_HEADER = /forward|real-ip|client-ip|connecting-ip|true-client|envoy|^via$/i;
-function forwardingHeaders(req: FastifyRequest): string {
-  const found = Object.entries(req.headers)
-    .filter(([name]) => FORWARDING_HEADER.test(name))
-    .map(([name, value]) => `${name}=${JSON.stringify(value)}`);
-  return [`peer=${req.socket.remoteAddress}`, ...found].join(' ');
-}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Mirrors db.ts's FOTA_DATA_DIR override pattern - unset locally, so this
@@ -50,7 +39,7 @@ const FIRMWARE_DIR =
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   await mkdir(FIRMWARE_DIR, { recursive: true });
   bootstrapAdmins();
-  const loginLimiter = createLoginRateLimiter({ enforceIpLimit: false });
+  const loginLimiter = createLoginRateLimiter({ enforceIpLimit: true });
 
   app.get('/admin/api/session', async (req, reply) => {
     const email = getSessionEmail(req);
@@ -64,12 +53,13 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (!email || !password) {
       return reply.code(400).send({ error: 'BAD_REQUEST', message: 'email and password are required.' });
     }
-    // Wrong password, unknown email and a locked account all get the same
-    // message; only the status (429 + Retry-After) tells a lockout apart.
-    // req.ip is logged here, never sent back.
+    warnOnUnexpectedProxyLayout(req);
+    // Wrong password, unknown email and a locked account or IP all get the
+    // same message; only the status (429 + Retry-After) tells a lockout
+    // apart. req.ip is logged here, never sent back.
     const retryAfterMs = loginLimiter.retryAfterMs(email, req.ip);
     if (retryAfterMs > 0) {
-      console.log(`[admin login] locked out, status=429 ip=${req.ip} ${forwardingHeaders(req)}`);
+      console.log(`[admin login] locked out, status=429 ip=${req.ip}`);
       return reply
         .code(429)
         .header('retry-after', String(Math.ceil(retryAfterMs / 1000)))
@@ -78,7 +68,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const admin = verifyAdminLogin(email, password);
     if (!admin) {
       loginLimiter.recordFailure(email, req.ip);
-      console.log(`[admin login] failed, status=401 ip=${req.ip} ${forwardingHeaders(req)}`);
+      console.log(`[admin login] failed, status=401 ip=${req.ip}`);
       return reply.code(401).send({ error: 'UNAUTHORIZED', message: LOGIN_FAILED_MESSAGE });
     }
     loginLimiter.recordSuccess(email);

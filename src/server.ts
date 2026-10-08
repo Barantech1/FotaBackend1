@@ -4,15 +4,13 @@ import { pathToFileURL } from 'node:url';
 import { adminRoutes } from './routes/admin.js';
 import { adminUiRoutes } from './routes/admin-ui.js';
 import { fotaRoutes } from './routes/fota.js';
+import { TRUSTED_PROXY_HOPS } from './proxyLayout.js';
 
 export function buildServer() {
-  // trustProxy: 1 - req.ip is the rightmost X-Forwarded-For entry. On
-  // Railway this was verified (2026-10-07) NOT to be the client: it is one
-  // of several Railway proxy addresses (152.233.x.x), so req.ip must not be
-  // used to tell clients apart until the right source is confirmed (see
-  // loginRateLimit.ts). Locally (no proxy header) req.ip is the socket
-  // address.
-  const app = Fastify({ logger: false, trustProxy: 1 });
+  // Trusts Railway's two proxy hops (socket peer + edge), so req.ip is the
+  // client - see proxyLayout.ts for the verified layout. Locally (no proxy
+  // header) req.ip is the socket address.
+  const app = Fastify({ logger: false, trustProxy: TRUSTED_PROXY_HOPS });
   app.register(multipart);
   app.register(adminRoutes);
   app.register(adminUiRoutes);

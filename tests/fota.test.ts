@@ -279,11 +279,14 @@ describe('FOTA backend', () => {
     describe('login rate limiting', () => {
       const FIFTEEN_MINUTES = 15 * 60 * 1000;
 
-      function attempt(email: string, password: string, forwardedFor = '198.51.100.1') {
+      // Mirrors Railway's live layout (src/proxyLayout.ts): X-Forwarded-For
+      // arrives as "client, edge" from an internal proxy (the socket peer).
+      function attempt(email: string, password: string, opts: { client?: string; forwardedFor?: string } = {}) {
         return app.inject({
           method: 'POST',
           url: '/admin/api/login',
-          headers: { 'x-forwarded-for': forwardedFor },
+          remoteAddress: '100.64.0.2',
+          headers: { 'x-forwarded-for': opts.forwardedFor ?? `${opts.client ?? '198.51.100.1'}, 152.233.12.245` },
           payload: { email, password },
         });
       }
@@ -343,15 +346,66 @@ describe('FOTA backend', () => {
         expect((await attempt('admin@example.com', 'test-password')).statusCode).toBe(200);
       });
 
-      it('does not enforce the per-IP cap for now (req.ip is a shared Railway proxy address)', async () => {
-        // 25 emails x 4 failures: 100 failures from one IP, no account locked.
+      it('takes the client from "client, edge" plus a socket peer (the live Railway layout)', async () => {
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        try {
+          await attempt('nobody@example.com', 'wrong-password', { forwardedFor: '62.90.131.230, 152.233.12.245' });
+          expect(log).toHaveBeenCalledWith('[admin login] failed, status=401 ip=62.90.131.230');
+        } finally {
+          log.mockRestore();
+        }
+      });
+
+      it('caps failures per client IP at 100 per 15 minutes, ignoring forged X-Forwarded-For entries', async () => {
+        // 25 emails x 4 failures: 100 failures from one client, no account
+        // locked, arriving through varying Railway edges as on the live site.
         for (let n = 0; n < 25; n++) {
           for (let i = 0; i < 4; i++) {
-            expect((await attempt(`user${n}@example.com`, 'wrong-password', '203.0.113.7')).statusCode).toBe(401);
+            const res = await attempt(`user${n}@example.com`, 'wrong-password', {
+              forwardedFor: `203.0.113.7, 152.233.13.${164 + (i % 3)}`,
+            });
+            expect(res.statusCode).toBe(401);
           }
         }
-        expect((await attempt('admin@example.com', 'test-password', '203.0.113.7')).statusCode).toBe(200);
+        const blocked = await attempt('admin@example.com', 'test-password', { client: '203.0.113.7' });
+        expect(blocked.statusCode).toBe(429);
+        expect(blocked.json().message).toBe('Invalid email or password.');
+        expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
+
+        // A forged entry in front doesn't get the blocked client out...
+        const forgedOut = await attempt('admin@example.com', 'test-password', {
+          forwardedFor: '192.0.2.99, 203.0.113.7, 152.233.12.245',
+        });
+        expect(forgedOut.statusCode).toBe(429);
+        // ...and naming the blocked IP doesn't get another client blocked.
+        const forgedIn = await attempt('admin@example.com', 'test-password', {
+          forwardedFor: '203.0.113.7, 198.51.100.2, 152.233.12.245',
+        });
+        expect(forgedIn.statusCode).toBe(200);
+        expect((await attempt('admin@example.com', 'test-password', { client: '198.51.100.3' })).statusCode).toBe(200);
+
+        vi.setSystemTime(Date.now() + FIFTEEN_MINUTES);
+        expect((await attempt('admin@example.com', 'test-password', { client: '203.0.113.7' })).statusCode).toBe(200);
       }, 30_000);
+
+      it('warns, with the count only, when X-Forwarded-For does not have 2 entries', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+          await attempt('nobody@example.com', 'wrong-password', { forwardedFor: '62.90.131.230, 152.233.12.245' });
+          expect(warn).not.toHaveBeenCalled();
+
+          await attempt('nobody@example.com', 'wrong-password', {
+            forwardedFor: '192.0.2.99, 62.90.131.230, 152.233.12.245',
+          });
+          await attempt('nobody@example.com', 'wrong-password', { forwardedFor: '62.90.131.230' });
+          expect(warn.mock.calls.map((call) => call[0])).toEqual([
+            '[proxy layout] X-Forwarded-For has 3 entries, expected 2; req.ip may not be the client',
+            '[proxy layout] X-Forwarded-For has 1 entries, expected 2; req.ip may not be the client',
+          ]);
+        } finally {
+          warn.mockRestore();
+        }
+      });
     });
 
     it('logs in, reads a signed session back, and logs out', async () => {

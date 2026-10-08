@@ -7,13 +7,10 @@
  * (counted for unknown emails too, so a lockout reveals nothing about which
  * emails are admins). Per IP: 100 failures within 15 minutes block that IP
  * until the oldest falls out of the window - best-effort, since the IP is
- * only as trustworthy as the proxy hop it is read from (see server.ts).
- *
- * The per-IP block is NOT enforced for now (enforceIpLimit: false): on
- * Railway, req.ip turned out to be a shared Railway proxy address, not the
- * client's, so enforcing it would let anyone block every admin's login.
- * IP failures are still counted, so enforcing it again is a one-flag change
- * once the real client IP source is confirmed.
+ * only as trustworthy as the proxy hops it is read from (see proxyLayout.ts).
+ * enforceIpLimit: false keeps counting but never blocks by IP - the switch
+ * to use if req.ip ever stops being the client (it was briefly off while
+ * Railway's proxy layout was being confirmed).
  */
 export const ACCOUNT_MAX_FAILURES = 5;
 export const IP_MAX_FAILURES = 100;
